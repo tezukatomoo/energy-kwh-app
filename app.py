@@ -1,7 +1,7 @@
 import io
 import re
 import unicodedata
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import streamlit as st
 import pdfplumber
@@ -70,7 +70,7 @@ def extract_type_key_from_label(label: str) -> str:
 
 
 # =========================================================
-# PDFから消費電力量[kWh] *1 を抽出
+# PDFから消費電力量[kWh] *1 を抽出（専用部）
 # =========================================================
 def extract_kwh_from_pdf_bytes(pdf_bytes: bytes) -> Optional[int]:
     try:
@@ -98,6 +98,115 @@ def extract_kwh_from_pdf_bytes(pdf_bytes: bytes) -> Optional[int]:
 
 
 # =========================================================
+# 共用部PDFから消費電力量を抽出（3ページ目）
+# =========================================================
+def extract_common_area_energy(pdf_bytes: bytes) -> Tuple[Optional[float], Optional[float], Optional[float], list]:
+    """
+    共用部PDFの3ページ目から以下を抽出:
+    - 建物全体の値（太陽光削減後）
+    - 太陽光削減量（建物全体の3行上）
+    - 実際の消費電力（建物全体 - 太陽光削減量）
+    
+    Returns:
+        (建物全体MWh, 太陽光削減MWh, 実際の消費電力MWh, デバッグ情報)
+    """
+    debug_info = []
+    
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            debug_info.append(f"PDFページ数: {len(pdf.pages)}ページ")
+            if len(pdf.pages) < 3:
+                debug_info.append(f"❌ ページ数不足: 3ページ目が存在しません")
+                return None, None, None, debug_info
+            
+            page = pdf.pages[2]  # 3ページ目（0-indexed）
+            raw = page.extract_text() or ""
+            debug_info.append(f"✓ 3ページ目のテキスト抽出成功: {len(raw)}文字")
+    except Exception as e:
+        debug_info.append(f"❌ PDF読み込みエラー: {str(e)}")
+        return None, None, None, debug_info
+
+    raw = unicodedata.normalize("NFKC", raw)
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    debug_info.append(f"抽出行数: {len(lines)}行")
+
+    # 「２．二次エネルギー消費量計算結果」セクションを探す
+    section_start_idx = None
+    for i, ln in enumerate(lines):
+        if "２" in ln and "二次エネルギー消費量計算結果" in ln:
+            section_start_idx = i
+            debug_info.append(f"✓ セクション発見(行{i}): {ln[:50]}")
+            break
+        elif "二次エネルギー消費量計算結果" in ln and section_start_idx is None:
+            section_start_idx = i
+            debug_info.append(f"✓ セクション発見(行{i}): {ln[:50]}")
+            break
+    
+    if section_start_idx is None:
+        debug_info.append("❌ 二次エネルギー消費量計算結果セクションが見つかりません")
+        # セクション周辺の行を表示
+        for i, ln in enumerate(lines[:30]):
+            if "二次" in ln or "エネルギー" in ln or "計算結果" in ln:
+                debug_info.append(f"  関連行{i}: {ln[:80]}")
+        return None, None, None, debug_info
+
+    # セクション開始位置以降から「建物全体」を探す
+    building_total = None
+    solar_reduction = None
+    building_idx = None
+    
+    # セクション以降の行を確認
+    debug_info.append(f"\nセクション以降の行({section_start_idx}〜)を検索:")
+    for i in range(section_start_idx, min(section_start_idx + 20, len(lines))):
+        ln = lines[i]
+        debug_info.append(f"  行{i}: {ln[:80]}")
+        
+        if "建物全体" in ln:
+            building_idx = i
+            debug_info.append(f"✓ 建物全体発見(行{i}): {ln}")
+            
+            # 同じ行または次の行から数値を探す
+            for offset in range(0, 5):
+                if i + offset < len(lines):
+                    search_line = lines[i + offset]
+                    # 小数点を含む数値を探す（最初の数値を取得）
+                    match = re.search(r"(\d+\.\d+)", search_line)
+                    if match:
+                        building_total = float(match.group(1))
+                        debug_info.append(f"✓ 建物全体の値: {building_total} MWh (行{i+offset})")
+                        break
+            break
+    
+    # 太陽光削減量を探す（建物全体の前の部分から）
+    if building_idx is not None:
+        debug_info.append(f"\n太陽光削減量を検索(行{max(section_start_idx, building_idx - 15)}〜{building_idx}):")
+        # 建物全体より前の行で「太陽光」を含む行を探す
+        for i in range(max(section_start_idx, building_idx - 15), building_idx):
+            ln = lines[i]
+            if "太陽光" in ln or "PV" in ln:
+                debug_info.append(f"  太陽光関連(行{i}): {ln}")
+                # その行または次の数行でマイナスの数値を探す
+                for offset in range(0, 4):
+                    if i + offset < len(lines):
+                        search_line = lines[i + offset]
+                        match = re.search(r"(-\d+\.\d+)", search_line)
+                        if match:
+                            solar_reduction = float(match.group(1))
+                            debug_info.append(f"✓ 太陽光削減量: {solar_reduction} MWh (行{i+offset})")
+                            break
+                if solar_reduction:
+                    break
+    
+    if building_total is not None and solar_reduction is not None:
+        actual_consumption = building_total - solar_reduction
+        debug_info.append(f"\n✓ 計算完了: {building_total} - ({solar_reduction}) = {actual_consumption} MWh")
+        return building_total, solar_reduction, actual_consumption, debug_info
+    
+    debug_info.append(f"\n❌ 抽出失敗 - 建物全体: {building_total}, 太陽光: {solar_reduction}")
+    return building_total, solar_reduction, None, debug_info
+
+
+# =========================================================
 # 住戸リストCSVの列検出
 # =========================================================
 def detect_unitlist_columns(df: pd.DataFrame):
@@ -115,7 +224,11 @@ def detect_unitlist_columns(df: pd.DataFrame):
 # =========================================================
 # Excel（標準形）作成
 # =========================================================
-def build_standard_excel(unit_list: pd.DataFrame, project_name: str) -> bytes:
+def build_standard_excel(
+    unit_list: pd.DataFrame, 
+    project_name: str,
+    common_area_mwh: Optional[float] = None
+) -> bytes:
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "集計"
@@ -125,6 +238,8 @@ def build_standard_excel(unit_list: pd.DataFrame, project_name: str) -> bytes:
     header_fill = PatternFill("solid", fgColor="E6F2FF")
     total_fill = PatternFill("solid", fgColor="FFF2CC")
     title_fill = PatternFill("solid", fgColor="D9EAD3")
+    common_fill = PatternFill("solid", fgColor="E8DAEF")
+    grand_fill = PatternFill("solid", fgColor="FCE4D6")
     bold = Font(bold=True)
     center = Alignment(horizontal="center")
     right = Alignment(horizontal="right")
@@ -159,19 +274,42 @@ def build_standard_excel(unit_list: pd.DataFrame, project_name: str) -> bytes:
         ws.cell(row=r, column=3).alignment = center
         ws.cell(row=r, column=4).alignment = right
 
-    # 左合計
+    # 左合計（専用部）
     total_units = int(unit_list["住戸の番号"].nunique())
     total_kwh = int(unit_list["消費電力量[kWh]"].sum())
     sum_row = len(unit_list) + 3
 
-    ws.cell(row=sum_row, column=1, value="合計住戸数").fill = total_fill
+    ws.cell(row=sum_row, column=1, value="専用部合計住戸数").fill = total_fill
     ws.cell(row=sum_row, column=2, value=total_units).fill = total_fill
-    ws.cell(row=sum_row, column=3, value="合計消費電力量[kWh]").fill = total_fill
+    ws.cell(row=sum_row, column=3, value="専用部合計消費電力量[kWh]").fill = total_fill
     ws.cell(row=sum_row, column=4, value=total_kwh).fill = total_fill
 
     for c in range(1, 5):
         ws.cell(row=sum_row, column=c).font = bold
         ws.cell(row=sum_row, column=c).border = border
+
+    # 共用部を追加
+    if common_area_mwh is not None:
+        common_kwh = int(common_area_mwh * 1000)  # MWh -> kWh
+        sum_row += 1
+        ws.cell(row=sum_row, column=3, value="共用部消費電力量[kWh]").fill = common_fill
+        ws.cell(row=sum_row, column=4, value=common_kwh).fill = common_fill
+        ws.cell(row=sum_row, column=3).font = bold
+        ws.cell(row=sum_row, column=4).font = bold
+        ws.cell(row=sum_row, column=3).border = border
+        ws.cell(row=sum_row, column=4).border = border
+        ws.cell(row=sum_row, column=4).alignment = right
+
+        # 建物全体合計
+        grand_total = total_kwh + common_kwh
+        sum_row += 1
+        ws.cell(row=sum_row, column=3, value="建物全体消費電力量[kWh]").fill = grand_fill
+        ws.cell(row=sum_row, column=4, value=grand_total).fill = grand_fill
+        ws.cell(row=sum_row, column=3).font = Font(bold=True, size=12)
+        ws.cell(row=sum_row, column=4).font = Font(bold=True, size=12)
+        ws.cell(row=sum_row, column=3).border = border
+        ws.cell(row=sum_row, column=4).border = border
+        ws.cell(row=sum_row, column=4).alignment = right
 
     # タイプ別集計
     ts = (
@@ -208,15 +346,16 @@ def build_standard_excel(unit_list: pd.DataFrame, project_name: str) -> bytes:
         for c in range(6, 10):
             ws.cell(row=r0, column=c).alignment = right if c >= 7 else center
         r0 += 1
-   # 右：合計（タイプ別集計の下に表示）
+    
+    # 右：合計（タイプ別集計の下に表示）
     sum_units = int(ts["戸数"].sum())
     sum_kwh = int(ts["合計消費電力量_kWh"].sum())
 
     # 1行空けて見やすくする
     r0 += 1
 
-    # 合計住戸数
-    ws.cell(row=r0, column=6, value="合計住戸数").fill = total_fill
+    # 専用部合計住戸数
+    ws.cell(row=r0, column=6, value="専用部合計住戸数").fill = total_fill
     ws.cell(row=r0, column=7, value=sum_units).fill = total_fill
     ws.cell(row=r0, column=6).font = bold
     ws.cell(row=r0, column=7).font = bold
@@ -225,9 +364,9 @@ def build_standard_excel(unit_list: pd.DataFrame, project_name: str) -> bytes:
     ws.cell(row=r0, column=6).alignment = center
     ws.cell(row=r0, column=7).alignment = right
 
-    # 合計消費電力量
+    # 専用部合計消費電力量
     r0 += 1
-    ws.cell(row=r0, column=6, value="合計消費電力量[kWh]").fill = total_fill
+    ws.cell(row=r0, column=6, value="専用部合計消費電力量[kWh]").fill = total_fill
     ws.cell(row=r0, column=7, value=sum_kwh).fill = total_fill
     ws.cell(row=r0, column=6).font = bold
     ws.cell(row=r0, column=7).font = bold
@@ -235,6 +374,31 @@ def build_standard_excel(unit_list: pd.DataFrame, project_name: str) -> bytes:
     ws.cell(row=r0, column=7).border = border
     ws.cell(row=r0, column=6).alignment = center
     ws.cell(row=r0, column=7).alignment = right
+
+    # 共用部と建物全体（右側にも表示）
+    if common_area_mwh is not None:
+        common_kwh = int(common_area_mwh * 1000)
+        
+        r0 += 1
+        ws.cell(row=r0, column=6, value="共用部消費電力量[kWh]").fill = common_fill
+        ws.cell(row=r0, column=7, value=common_kwh).fill = common_fill
+        ws.cell(row=r0, column=6).font = bold
+        ws.cell(row=r0, column=7).font = bold
+        ws.cell(row=r0, column=6).border = border
+        ws.cell(row=r0, column=7).border = border
+        ws.cell(row=r0, column=6).alignment = center
+        ws.cell(row=r0, column=7).alignment = right
+
+        grand_total = sum_kwh + common_kwh
+        r0 += 1
+        ws.cell(row=r0, column=6, value="建物全体消費電力量[kWh]").fill = grand_fill
+        ws.cell(row=r0, column=7, value=grand_total).fill = grand_fill
+        ws.cell(row=r0, column=6).font = Font(bold=True, size=12)
+        ws.cell(row=r0, column=7).font = Font(bold=True, size=12)
+        ws.cell(row=r0, column=6).border = border
+        ws.cell(row=r0, column=7).border = border
+        ws.cell(row=r0, column=6).alignment = center
+        ws.cell(row=r0, column=7).alignment = right
 
     # 列幅
     ws.column_dimensions["A"].width = 10
@@ -256,7 +420,7 @@ def build_standard_excel(unit_list: pd.DataFrame, project_name: str) -> bytes:
 # Streamlit UI
 # =========================================================
 def main():
-    st.title("東京都環境計画書　専用部 消費電力量集計ツール")
+    st.title("東京都環境計画書　専用部・共用部 消費電力量集計ツール")
 
     project_name = st.text_input(
         "物件名",
@@ -269,17 +433,23 @@ def main():
     )
 
     pdf_files = st.file_uploader(
-        "タイプ別PDF（複数選択）",
+        "専用部タイプ別PDF（複数選択）",
         type=["pdf"],
         accept_multiple_files=True
     )
 
+    common_pdf = st.file_uploader(
+        "共用部PDF（1ファイル）",
+        type=["pdf"],
+        key="common_pdf"
+    )
+
     if st.button("集計実行"):
         if not csv_file or not pdf_files:
-            st.error("CSVとPDFを両方アップロードしてください")
+            st.error("CSVと専用部PDFを両方アップロードしてください")
             return
 
-        # PDF → タイプ別kWh
+        # PDF → タイプ別kWh（専用部）
         type_kwh: Dict[str, Optional[int]] = {}
         rows = []
 
@@ -289,8 +459,37 @@ def main():
             rows.append({"PDF名": f.name, "タイプ": tkey, "kWh": kwh})
             type_kwh[tkey] = kwh
 
-        st.subheader("PDF抽出結果")
+        st.subheader("専用部PDF抽出結果")
         st.dataframe(pd.DataFrame(rows))
+
+        # 共用部PDF処理
+        common_area_mwh = None
+        if common_pdf:
+            building_total, solar_reduction, actual_consumption, debug_info = extract_common_area_energy(common_pdf.read())
+            
+            st.subheader("共用部PDF抽出結果")
+            
+            # デバッグ情報を表示
+            with st.expander("🔍 抽出デバッグ情報", expanded=False):
+                for info in debug_info:
+                    st.text(info)
+            
+            if actual_consumption is not None:
+                st.success(f"✅ 共用部消費電力量を抽出しました")
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("建物全体（太陽光削減後）", f"{building_total:.2f} MWh")
+                with col2:
+                    st.metric("太陽光削減量", f"{solar_reduction:.2f} MWh")
+                with col3:
+                    st.metric("実際の消費電力", f"{actual_consumption:.2f} MWh", 
+                             delta=f"{actual_consumption * 1000:.0f} kWh")
+                common_area_mwh = actual_consumption
+            else:
+                st.error("⚠️ 共用部PDFから値を抽出できませんでした")
+                if building_total:
+                    st.info(f"建物全体の値のみ取得: {building_total:.2f} MWh")
+                st.warning("デバッグ情報を確認してください")
 
         # CSV読み込み
         for enc in ("utf-8-sig", "cp932", "utf-8"):
@@ -320,9 +519,20 @@ def main():
             st.warning("kWhが取得できていないタイプがあります")
             st.dataframe(missing["タイプ"].value_counts())
 
-        excel = build_standard_excel(unit_list, project_name)
+        # 集計結果表示
+        st.subheader("集計結果")
+        total_private = int(unit_list["消費電力量[kWh]"].sum())
+        st.metric("専用部合計", f"{total_private:,} kWh")
+        
+        if common_area_mwh:
+            common_kwh = int(common_area_mwh * 1000)
+            st.metric("共用部", f"{common_kwh:,} kWh")
+            st.metric("建物全体", f"{total_private + common_kwh:,} kWh", 
+                     delta="専用部 + 共用部")
+
+        excel = build_standard_excel(unit_list, project_name, common_area_mwh)
         st.download_button(
-            "Excelダウンロード",
+            "📊 Excelダウンロード",
             data=excel,
             file_name=f"{project_name}_消費電力量集計.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

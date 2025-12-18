@@ -256,7 +256,7 @@ def build_standard_excel(unit_list: pd.DataFrame, project_name: str) -> bytes:
 # Streamlit UI
 # =========================================================
 def main():
-    st.title("住戸別・タイプ別 消費電力量集計ツール")
+    st.title("東京都環境計画書　専用部 消費電力量集計ツール")
 
     project_name = st.text_input(
         "物件名",

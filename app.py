@@ -2,12 +2,21 @@ import io
 import re
 import unicodedata
 from typing import Dict, Optional, Tuple
+from datetime import datetime
 
 import streamlit as st
 import pdfplumber
 import pandas as pd
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 
 
 # =========================================================
@@ -219,6 +228,206 @@ def detect_unitlist_columns(df: pd.DataFrame):
     if not candidates:
         raise RuntimeError("『住宅タイプの名称』列が見つかりません")
     return col_row, col_num, candidates[0]
+
+
+# =========================================================
+# PDF出力機能
+# =========================================================
+def build_pdf_report(
+    unit_list: pd.DataFrame,
+    project_name: str,
+    common_area_mwh: Optional[float] = None,
+    building_total: Optional[float] = None,
+    solar_reduction: Optional[float] = None
+) -> bytes:
+    """
+    集計結果をPDFレポートとして出力
+    """
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=20*mm,
+        leftMargin=20*mm,
+        topMargin=20*mm,
+        bottomMargin=20*mm
+    )
+    
+    # 日本語フォント設定（システムフォントを試す）
+    try:
+        # Windowsの場合
+        pdfmetrics.registerFont(TTFont('Japanese', 'C:\\Windows\\Fonts\\msgothic.ttc', subfontIndex=0))
+        font_name = 'Japanese'
+    except:
+        try:
+            # macOSの場合
+            pdfmetrics.registerFont(TTFont('Japanese', '/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc', subfontIndex=0))
+            font_name = 'Japanese'
+        except:
+            # フォールバック：日本語が表示されない可能性あり
+            font_name = 'Helvetica'
+    
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Heading1'],
+        fontName=font_name,
+        fontSize=16,
+        alignment=TA_CENTER,
+        spaceAfter=20
+    )
+    heading_style = ParagraphStyle(
+        'CustomHeading',
+        parent=styles['Heading2'],
+        fontName=font_name,
+        fontSize=14,
+        spaceAfter=10
+    )
+    normal_style = ParagraphStyle(
+        'CustomNormal',
+        parent=styles['Normal'],
+        fontName=font_name,
+        fontSize=10
+    )
+    
+    elements = []
+    
+    # タイトル
+    elements.append(Paragraph(project_name, title_style))
+    elements.append(Paragraph(f"作成日時: {datetime.now().strftime('%Y年%m月%d日 %H:%M')}", normal_style))
+    elements.append(Spacer(1, 10*mm))
+    
+    # 集計サマリー
+    elements.append(Paragraph("集計結果サマリー", heading_style))
+    
+    total_private_kwh = int(unit_list["消費電力量[kWh]"].sum())
+    summary_data = [
+        ["専用部合計消費電力量", f"{total_private_kwh:,} kWh"]
+    ]
+    
+    if common_area_mwh:
+        common_kwh = int(common_area_mwh * 1000)
+        grand_total = total_private_kwh + common_kwh
+        summary_data.extend([
+            ["共用部消費電力量", f"{common_kwh:,} kWh"],
+            ["建物全体消費電力量", f"{grand_total:,} kWh"]
+        ])
+    
+    summary_table = Table(summary_data, colWidths=[80*mm, 80*mm])
+    summary_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (0, -1), colors.lightblue),
+        ('BACKGROUND', (0, -1), (-1, -1), colors.yellow),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ('FONTNAME', (0, 0), (-1, -1), font_name),
+        ('FONTSIZE', (0, 0), (-1, -1), 11),
+        ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+        ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('TOPPADDING', (0, 0), (-1, -1), 8),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+    ]))
+    elements.append(summary_table)
+    elements.append(Spacer(1, 10*mm))
+    
+    # 共用部の詳細計算
+    if common_area_mwh and building_total is not None and solar_reduction is not None:
+        elements.append(Paragraph("共用部消費電力量の計算内訳", heading_style))
+        
+        common_detail_data = [
+            ["項目", "値"],
+            ["建物全体（太陽光削減後）", f"{building_total:.2f} MWh"],
+            ["太陽光削減量", f"{solar_reduction:.2f} MWh"],
+            ["実際の消費電力（太陽光削減前）", f"{common_area_mwh:.2f} MWh"],
+            ["", f"= {common_area_mwh * 1000:.0f} kWh"]
+        ]
+        
+        common_detail_table = Table(common_detail_data, colWidths=[80*mm, 80*mm])
+        common_detail_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.lightblue),
+            ('BACKGROUND', (0, 3), (-1, 3), colors.lightgreen),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+            ('FONTNAME', (0, 0), (-1, -1), font_name),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+            ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ]))
+        elements.append(common_detail_table)
+        elements.append(Spacer(1, 5*mm))
+        
+        # 計算式の説明
+        calc_text = f"計算式: {building_total:.2f} - ({solar_reduction:.2f}) = {common_area_mwh:.2f} MWh"
+        elements.append(Paragraph(calc_text, normal_style))
+        elements.append(Spacer(1, 10*mm))
+    
+    # タイプ別集計
+    elements.append(Paragraph("タイプ別集計", heading_style))
+    
+    type_summary = (
+        unit_list
+        .groupby("タイプ", as_index=False)
+        .agg(
+            戸数=("住戸の番号", "count"),
+            合計消費電力量=("消費電力量[kWh]", "sum")
+        )
+    )
+    type_summary["1住戸あたり"] = (type_summary["合計消費電力量"] / type_summary["戸数"]).round(0).astype(int)
+    
+    type_data = [["タイプ", "戸数", "1住戸あたり[kWh]", "合計[kWh]"]]
+    for _, row in type_summary.sort_values("タイプ").iterrows():
+        type_data.append([
+            str(row["タイプ"]),
+            f"{int(row['戸数'])}",
+            f"{int(row['1住戸あたり']):,}",
+            f"{int(row['合計消費電力量']):,}"
+        ])
+    
+    type_table = Table(type_data, colWidths=[40*mm, 30*mm, 45*mm, 45*mm])
+    type_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.lightblue),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ('FONTNAME', (0, 0), (-1, -1), font_name),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('ALIGN', (0, 0), (0, -1), 'CENTER'),
+        ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('TOPPADDING', (0, 0), (-1, -1), 6),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+    ]))
+    elements.append(type_table)
+    elements.append(PageBreak())
+    
+    # 住戸別詳細（ページ分割）
+    elements.append(Paragraph("住戸別詳細", heading_style))
+    
+    detail_data = [["行番号", "住戸番号", "タイプ", "消費電力量[kWh]"]]
+    for _, row in unit_list.iterrows():
+        detail_data.append([
+            str(row["行番号"]),
+            str(row["住戸の番号"]),
+            str(row["タイプ"]),
+            f"{int(row['消費電力量[kWh]']) if pd.notna(row['消費電力量[kWh]']) else '-':,}" if pd.notna(row['消費電力量[kWh]']) else "-"
+        ])
+    
+    detail_table = Table(detail_data, colWidths=[25*mm, 35*mm, 40*mm, 60*mm])
+    detail_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.lightblue),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ('FONTNAME', (0, 0), (-1, -1), font_name),
+        ('FONTSIZE', (0, 0), (-1, -1), 8),
+        ('ALIGN', (0, 0), (2, -1), 'CENTER'),
+        ('ALIGN', (3, 0), (3, -1), 'RIGHT'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('TOPPADDING', (0, 0), (-1, -1), 4),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+    ]))
+    elements.append(detail_table)
+    
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 # =========================================================
@@ -464,6 +673,9 @@ def main():
 
         # 共用部PDF処理
         common_area_mwh = None
+        building_total_value = None
+        solar_reduction_value = None
+        
         if common_pdf:
             building_total, solar_reduction, actual_consumption, debug_info = extract_common_area_energy(common_pdf.read())
             
@@ -485,6 +697,8 @@ def main():
                     st.metric("実際の消費電力", f"{actual_consumption:.2f} MWh", 
                              delta=f"{actual_consumption * 1000:.0f} kWh")
                 common_area_mwh = actual_consumption
+                building_total_value = building_total
+                solar_reduction_value = solar_reduction
             else:
                 st.error("⚠️ 共用部PDFから値を抽出できませんでした")
                 if building_total:
@@ -530,13 +744,36 @@ def main():
             st.metric("建物全体", f"{total_private + common_kwh:,} kWh", 
                      delta="専用部 + 共用部")
 
-        excel = build_standard_excel(unit_list, project_name, common_area_mwh)
-        st.download_button(
-            "📊 Excelダウンロード",
-            data=excel,
-            file_name=f"{project_name}_消費電力量集計.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        # ダウンロード・印刷ボタン
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            excel = build_standard_excel(unit_list, project_name, common_area_mwh)
+            st.download_button(
+                "📊 Excelダウンロード",
+                data=excel,
+                file_name=f"{project_name}_消費電力量集計.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        
+        with col2:
+            # PDF出力ボタン
+            pdf_report = build_pdf_report(
+                unit_list, 
+                project_name, 
+                common_area_mwh,
+                building_total_value,
+                solar_reduction_value
+            )
+            st.download_button(
+                "📄 PDF出力",
+                data=pdf_report,
+                file_name=f"{project_name}_消費電力量集計.pdf",
+                mime="application/pdf",
+            )
+        
+        with col3:
+            st.info("💡 PDFをダウンロードして印刷できます")
 
 
 if __name__ == "__main__":

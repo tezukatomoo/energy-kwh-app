@@ -253,7 +253,7 @@ def build_pdf_report(
         bottomMargin=20*mm
     )
     
-    # 日本語フォント設定（システムフォントを試す）
+    # 日本語フォント設定
     try:
         # Windowsの場合
         pdfmetrics.registerFont(TTFont('Japanese', 'C:\\Windows\\Fonts\\msgothic.ttc', subfontIndex=0))
@@ -264,8 +264,18 @@ def build_pdf_report(
             pdfmetrics.registerFont(TTFont('Japanese', '/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc', subfontIndex=0))
             font_name = 'Japanese'
         except:
-            # フォールバック：日本語が表示されない可能性あり
-            font_name = 'Helvetica'
+            try:
+                # Linuxの場合（Streamlit Cloud含む）
+                pdfmetrics.registerFont(TTFont('Japanese', '/usr/share/fonts/truetype/fonts-japanese-gothic.ttf'))
+                font_name = 'Japanese'
+            except:
+                try:
+                    # IPAフォント（よく使われる）
+                    pdfmetrics.registerFont(TTFont('Japanese', '/usr/share/fonts/opentype/ipafont-gothic/ipagp.ttf'))
+                    font_name = 'Japanese'
+                except:
+                    # 最終フォールバック：Courier（日本語表示不可）
+                    font_name = 'Courier'
     
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle(

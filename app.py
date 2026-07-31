@@ -19,6 +19,7 @@ from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 
 
@@ -256,37 +257,58 @@ def extract_kwh_from_pdf_bytes(pdf_bytes: bytes) -> Optional[int]:
 # 共用部PDFから消費電力量を抽出（3ページ目）
 # =========================================================
 def extract_common_area_energy(pdf_bytes: bytes) -> Tuple[Optional[float], Optional[float], Optional[float], list]:
+    """共用部PDFから「建物全体」「太陽光削減量」「実消費電力」(MWh) を抽出。
+
+    対応フォーマット:
+      - 新 (Ver.3.10 2026.04 以降): 4ページ目に「二次エネルギー消費量計算結果」。
+        太陽光発電は正の値（例: 5.33）で表示される。
+      - 旧: 3ページ目に「二次エネルギー消費量計算結果」。
+        太陽光発電はマイナス符号付き（例: -5.78）で表示される。
+
+    solar_reduction は内部的に常に正の「削減量」として保持し、
+    actual_consumption = building_total + solar_reduction を返す。
+    """
     debug_info = []
-    
+
+    raw = None
+    page_used = None
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             debug_info.append(f"PDFページ数: {len(pdf.pages)}ページ")
-            if len(pdf.pages) < 3:
-                debug_info.append(f"❌ ページ数不足: 3ページ目が存在しません")
+            # 4ページ目→3ページ目の順に「二次エネルギー消費量計算結果」を探す（新旧両対応）
+            for idx in (3, 2):
+                if idx < len(pdf.pages):
+                    txt = pdf.pages[idx].extract_text() or ""
+                    txt_norm = unicodedata.normalize("NFKC", txt)
+                    if (
+                        "二次エネルギー消費量計算結果" in txt_norm
+                        and "建物全体" in txt_norm
+                    ):
+                        raw = txt_norm
+                        page_used = idx + 1
+                        debug_info.append(
+                            f"✓ {page_used}ページ目から「二次エネルギー消費量計算結果」を検出: {len(raw)}文字"
+                        )
+                        break
+            if raw is None:
+                debug_info.append(
+                    "❌ 「二次エネルギー消費量計算結果」が3〜4ページ目に見つかりません"
+                )
                 return None, None, None, debug_info
-            
-            page = pdf.pages[2]
-            raw = page.extract_text() or ""
-            debug_info.append(f"✓ 3ページ目のテキスト抽出成功: {len(raw)}文字")
     except Exception as e:
         debug_info.append(f"❌ PDF読み込みエラー: {str(e)}")
         return None, None, None, debug_info
 
-    raw = unicodedata.normalize("NFKC", raw)
     lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
     debug_info.append(f"抽出行数: {len(lines)}行")
 
     section_start_idx = None
     for i, ln in enumerate(lines):
-        if "２" in ln and "二次エネルギー消費量計算結果" in ln:
+        if "二次エネルギー消費量計算結果" in ln:
             section_start_idx = i
             debug_info.append(f"✓ セクション発見(行{i}): {ln[:50]}")
             break
-        elif "二次エネルギー消費量計算結果" in ln and section_start_idx is None:
-            section_start_idx = i
-            debug_info.append(f"✓ セクション発見(行{i}): {ln[:50]}")
-            break
-    
+
     if section_start_idx is None:
         debug_info.append("❌ 二次エネルギー消費量計算結果セクションが見つかりません")
         return None, None, None, debug_info
@@ -294,10 +316,11 @@ def extract_common_area_energy(pdf_bytes: bytes) -> Tuple[Optional[float], Optio
     building_total = None
     solar_reduction = None
     building_idx = None
-    
-    for i in range(section_start_idx, min(section_start_idx + 20, len(lines))):
+
+    for i in range(section_start_idx, min(section_start_idx + 30, len(lines))):
         ln = lines[i]
-        if "建物全体" in ln:
+        # 「建物全体（延床面積あたり）」は除外
+        if "建物全体" in ln and "延床" not in ln and building_total is None:
             building_idx = i
             for offset in range(0, 5):
                 if i + offset < len(lines):
@@ -307,28 +330,35 @@ def extract_common_area_energy(pdf_bytes: bytes) -> Tuple[Optional[float], Optio
                         building_total = float(match.group(1))
                         debug_info.append(f"✓ 建物全体の値: {building_total} MWh")
                         break
-            break
-    
+            if building_total is not None:
+                break
+
     if building_idx is not None:
-        for i in range(max(section_start_idx, building_idx - 15), building_idx):
+        for i in range(max(section_start_idx, building_idx - 20), building_idx):
             ln = lines[i]
             if "太陽光" in ln or "PV" in ln:
+                # マイナス符号あり/なし両対応。値は常に正の「削減量」として保持する
                 for offset in range(0, 4):
                     if i + offset < len(lines):
                         search_line = lines[i + offset]
-                        match = re.search(r"(-\d+\.\d+)", search_line)
+                        match = re.search(r"(-?\d+\.\d+)", search_line)
                         if match:
-                            solar_reduction = float(match.group(1))
-                            debug_info.append(f"✓ 太陽光削減量: {solar_reduction} MWh")
+                            solar_reduction = abs(float(match.group(1)))
+                            debug_info.append(
+                                f"✓ 太陽光削減量: {solar_reduction} MWh（符号は除去して正値で保持）"
+                            )
                             break
-                if solar_reduction:
+                if solar_reduction is not None:
                     break
-    
+
     if building_total is not None and solar_reduction is not None:
-        actual_consumption = building_total - solar_reduction
-        debug_info.append(f"✓ 計算完了: {building_total} - ({solar_reduction}) = {actual_consumption} MWh")
+        # 建物全体は太陽光削減後の値。実消費 = 建物全体 + 太陽光削減量
+        actual_consumption = building_total + solar_reduction
+        debug_info.append(
+            f"✓ 計算完了: {building_total} + {solar_reduction} = {actual_consumption} MWh"
+        )
         return building_total, solar_reduction, actual_consumption, debug_info
-    
+
     return building_total, solar_reduction, None, debug_info
 
 
@@ -367,24 +397,30 @@ def build_pdf_report(
         bottomMargin=20*mm
     )
     
-    # 日本語フォント設定
-    try:
-        pdfmetrics.registerFont(TTFont('Japanese', 'C:\\Windows\\Fonts\\msgothic.ttc', subfontIndex=0))
-        font_name = 'Japanese'
-    except:
+    # 日本語フォント設定（OS別TTFを順に試し、最後はreportlab内蔵CIDフォントに必ずフォールバック）
+    font_name = None
+    for ttf_path, idx in [
+        ('C:\\Windows\\Fonts\\msgothic.ttc', 0),               # Windows
+        ('/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc', 0),  # macOS
+        ('/usr/share/fonts/truetype/fonts-japanese-gothic.ttf', None),
+        ('/usr/share/fonts/opentype/ipafont-gothic/ipagp.ttf', None),
+    ]:
         try:
-            pdfmetrics.registerFont(TTFont('Japanese', '/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc', subfontIndex=0))
+            if idx is not None:
+                pdfmetrics.registerFont(TTFont('Japanese', ttf_path, subfontIndex=idx))
+            else:
+                pdfmetrics.registerFont(TTFont('Japanese', ttf_path))
             font_name = 'Japanese'
-        except:
-            try:
-                pdfmetrics.registerFont(TTFont('Japanese', '/usr/share/fonts/truetype/fonts-japanese-gothic.ttf'))
-                font_name = 'Japanese'
-            except:
-                try:
-                    pdfmetrics.registerFont(TTFont('Japanese', '/usr/share/fonts/opentype/ipafont-gothic/ipagp.ttf'))
-                    font_name = 'Japanese'
-                except:
-                    font_name = 'Courier'
+            break
+        except Exception:
+            continue
+    if font_name is None:
+        # Render等の最小環境向け: reportlab同梱のCID日本語フォント（追加パッケージ不要）
+        try:
+            pdfmetrics.registerFont(UnicodeCIDFont('HeiseiKakuGo-W5'))
+            font_name = 'HeiseiKakuGo-W5'
+        except Exception:
+            font_name = 'Courier'
     
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle(
@@ -471,7 +507,7 @@ def build_pdf_report(
         elements.append(common_detail_table)
         elements.append(Spacer(1, 5*mm))
         
-        calc_text = f"計算式: {building_total:.2f} - ({solar_reduction:.2f}) = {common_area_mwh:.2f} MWh"
+        calc_text = f"計算式: {building_total:.2f} + {solar_reduction:.2f} = {common_area_mwh:.2f} MWh"
         elements.append(Paragraph(calc_text, normal_style))
         elements.append(Spacer(1, 10*mm))
     

@@ -2,7 +2,10 @@ import io
 import re
 import unicodedata
 from typing import Dict, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+
+# 作成日時は実行環境のタイムゾーンに依存させず、常に日本時間で表示する
+JST = timezone(timedelta(hours=9))
 
 import streamlit as st
 import pdfplumber
@@ -409,7 +412,7 @@ def build_pdf_report(
     elements = []
     
     elements.append(Paragraph(project_name, title_style))
-    elements.append(Paragraph(f"作成日時: {datetime.now().strftime('%Y年%m月%d日 %H:%M')}", normal_style))
+    elements.append(Paragraph(f"作成日時: {datetime.now(JST).strftime('%Y年%m月%d日 %H:%M')}", normal_style))
     elements.append(Spacer(1, 10*mm))
     
     elements.append(Paragraph("集計結果サマリー", heading_style))
@@ -449,7 +452,7 @@ def build_pdf_report(
             ["建物全体（太陽光削減後）", f"{building_total:.2f} MWh"],
             ["太陽光削減量", f"{solar_reduction:.2f} MWh"],
             ["実際の消費電力（太陽光削減前）", f"{common_area_mwh:.2f} MWh"],
-            ["", f"= {common_area_mwh * 1000:.0f} kWh"]
+            ["", f"= {common_area_mwh * 1000:,.0f} kWh"]
         ]
         
         common_detail_table = Table(common_detail_data, colWidths=[80*mm, 80*mm])
@@ -774,7 +777,7 @@ with col2:
                         with col2:
                             st.metric("☀️ 太陽光削減量", f"{solar_reduction:.2f} MWh")
                         with col3:
-                            st.metric("⚡ 実際の消費電力", f"{actual_consumption:.2f} MWh", delta=f"{actual_consumption * 1000:.0f} kWh")
+                            st.metric("⚡ 実際の消費電力", f"{actual_consumption:.2f} MWh", delta=f"{actual_consumption * 1000:,.0f} kWh")
                         common_area_mwh = actual_consumption
                         building_total_value = building_total
                         solar_reduction_value = solar_reduction
